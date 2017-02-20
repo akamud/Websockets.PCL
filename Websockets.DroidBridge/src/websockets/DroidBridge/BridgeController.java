@@ -22,7 +22,13 @@ import com.koushikdutta.async.http.WebSocket;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateExpiredException;
 import java.security.cert.X509Certificate;
 import java.util.Map;
 
@@ -31,6 +37,8 @@ public class BridgeController {
 
     private WebSocket mConnection;
     private static String TAG = "websockets";
+    private KeyStore appKeyStore;
+    private X509TrustManager defaultTrustManager;
 
     //MUST BE SET
     public BridgeProxy proxy;
@@ -43,16 +51,82 @@ public class BridgeController {
     }
 
     // connect websocket
-    public void Open(final String wsuri, final String protocol, final Map<String, String> headers) {
+    public void Open(final String wsuri, final String protocol, final Map<String, String> headers) throws NoSuchAlgorithmException, KeyStoreException {
         Log("BridgeController:Open");
 
-        AsyncHttpClient.getDefaultInstance().getSSLSocketMiddleware().setTrustManagers(new TrustManager[] {
-                new X509TrustManager() {
-                    public void checkClientTrusted(X509Certificate[] chain, String authType) {}
-                    public void checkServerTrusted(X509Certificate[] chain, String authType) {}
-                    public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[]{}; }
+        TrustManagerFactory tmf = TrustManagerFactory.getInstance("X509");
+        tmf.init((KeyStore) null);
+
+        X509TrustManager x509TrustManager = null;
+        for (TrustManager t : tmf.getTrustManagers()) {
+            if (t instanceof X509TrustManager) {
+                x509TrustManager = (X509TrustManager)t;
+            }
+        }
+
+        appKeyStore = loadAppKeyStore();
+        final X509TrustManager finalX509TrustManager = x509TrustManager;
+
+        AsyncHttpClient.getDefaultInstance().getSSLSocketMiddleware().setTrustManagers(new TrustManager[] { new X509TrustManager() {
+            private boolean isCertKnown(X509Certificate cert) {
+                try {
+                    return appKeyStore.getCertificateAlias(cert) != null;
+                } catch (KeyStoreException e) {
+                    return false;
                 }
-        });
+            }
+
+            private boolean isExpiredException(Throwable e) {
+                do {
+                    if (e instanceof CertificateExpiredException)
+                        return true;
+                    e = e.getCause();
+                } while (e != null);
+                return false;
+            }
+
+            public void checkCertTrusted(X509Certificate[] chain, String authType, boolean isServer)
+                                throws CertificateException
+            {
+                try {
+                    if (isServer)
+                        finalX509TrustManager.checkServerTrusted(chain, authType);
+                    else
+                        finalX509TrustManager.checkClientTrusted(chain, authType);
+                } catch (CertificateException ae) {
+                    // if the cert is stored in our appTrustManager, we ignore expiredness
+                    if (isExpiredException(ae)) {
+                        return;
+                    }
+                    if (isCertKnown(chain[0])) {
+                        return;
+                    }
+                    try {
+                        if (defaultTrustManager == null)
+                            throw ae;
+                        if (isServer)
+                            defaultTrustManager.checkServerTrusted(chain, authType);
+                        else
+                            defaultTrustManager.checkClientTrusted(chain, authType);
+                    } catch (CertificateException e) {
+                        e.printStackTrace();
+                        throw e;
+                    }
+                }
+            }
+
+            public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                return finalX509TrustManager.getAcceptedIssuers();
+            }
+
+            public void checkClientTrusted(java.security.cert.X509Certificate[] certs, String authType) throws CertificateException {
+                checkCertTrusted(certs, authType, false);
+            }
+
+            public void checkServerTrusted(java.security.cert.X509Certificate[] certs, String authType) throws CertificateException {
+                checkCertTrusted(certs, authType, true);
+            }
+        }});
 
         SSLContext sslContext = null;
 
@@ -184,5 +258,21 @@ public class BridgeController {
             RaiseClosed();
             Error("Failed to Error");
         }
+    }
+
+    public static KeyStore loadAppKeyStore() {
+        KeyStore ks;
+        try {
+            ks = KeyStore.getInstance(KeyStore.getDefaultType());
+        } catch (KeyStoreException e) {
+            return null;
+        }
+        try {
+            ks.load(null, null);
+            //ks.load(new java.io.FileInputStream(keyStoreFile), "MTM".toCharArray());
+        } catch (java.io.FileNotFoundException e) {
+        } catch (Exception e) {
+        }
+        return ks;
     }
 }
